@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 ########################################
 # Helpers
@@ -22,8 +22,8 @@ confirm() {
 # Internet check
 ########################################
 info "Checking internet connection..."
-if ! ping -c 1 ping.archlinux.com &>/dev/null; then
-  error "No internet connection. Please connect to the internet and rerun."
+if ! ping -c 1 ping.archlinux.org &>/dev/null; then
+  error "No internet connection. Connect to internet and rerun."
 fi
 info "Internet OK"
 
@@ -40,11 +40,11 @@ read -rp "Enter disk (e.g. /dev/sda): " DISK
 [[ -b "$DISK" ]] || error "Invalid disk"
 
 echo
-echo "⚠️  ALL DATA ON $DISK WILL BE ERASED!"
+echo "⚠️  WARNING: ALL DATA ON $DISK WILL BE ERASED!"
 confirm "Continue?" || exit 0
 
 ########################################
-# Partitioning (GPT + UEFI)
+# Partitioning
 ########################################
 info "Partitioning disk"
 
@@ -57,21 +57,22 @@ EFI_PART="${DISK}1"
 LUKS_PART="${DISK}2"
 
 ########################################
-# EFI format
+# Filesystems
 ########################################
+info "Formatting EFI"
 mkfs.fat -F32 "$EFI_PART"
 
 ########################################
-# LUKS encryption
+# LUKS
 ########################################
-info "Setting up LUKS"
+info "Setting up LUKS encryption"
 cryptsetup luksFormat "$LUKS_PART"
 cryptsetup open "$LUKS_PART" cryptlvm
 
 ########################################
-# LVM setup
+# LVM
 ########################################
-info "Creating LVM"
+info "Creating LVM layout"
 pvcreate /dev/mapper/cryptlvm
 vgcreate vg0 /dev/mapper/cryptlvm
 
@@ -79,7 +80,7 @@ lvcreate -L 200G vg0 -n root
 lvcreate -l 100%FREE vg0 -n home
 
 ########################################
-# Filesystems
+# Format LVs
 ########################################
 mkfs.ext4 /dev/vg0/root
 mkfs.ext4 /dev/vg0/home
@@ -97,6 +98,7 @@ mount "$EFI_PART" /mnt/boot
 ########################################
 # Mirrors
 ########################################
+info "Updating mirrors with reflector"
 pacman -Sy --noconfirm reflector
 
 cp /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist.backup
@@ -109,8 +111,9 @@ reflector \
   --save /etc/pacman.d/mirrorlist
 
 ########################################
-# Base install
+# Base system
 ########################################
+info "Installing base system"
 pacstrap -K /mnt \
   base linux linux-firmware sof-firmware base-devel \
   grub efibootmgr networkmanager vim \
@@ -124,10 +127,15 @@ confirm "Append fstab to /mnt/etc/fstab?" || error "Aborted"
 genfstab -U /mnt >> /mnt/etc/fstab
 
 ########################################
-# Chroot
+# Prepare chroot script
 ########################################
-arch-chroot /mnt /bin/bash <<EOF
-set -e
+info "Preparing chroot configuration script"
+
+UUID=$(blkid -s UUID -o value "$LUKS_PART")
+
+cat <<EOF > /mnt/root/chroot-setup.sh
+#!/usr/bin/env bash
+set -euo pipefail
 
 ########################################
 # Timezone
@@ -159,6 +167,7 @@ mkinitcpio -P
 ########################################
 # Root password
 ########################################
+echo "Set root password"
 passwd
 
 ########################################
@@ -179,11 +188,9 @@ sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 systemctl enable NetworkManager
 
 ########################################
-# GRUB
+# GRUB (LUKS)
 ########################################
-UUID=\$(blkid -s UUID -o value "$LUKS_PART")
-
-sed -i "s|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX=\"cryptdevice=UUID=\$UUID:cryptlvm root=/dev/vg0/root\"|" /etc/default/grub
+sed -i 's|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX="cryptdevice=UUID=$UUID:cryptlvm root=/dev/vg0/root"|' /etc/default/grub
 
 grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
 grub-mkconfig -o /boot/grub/grub.cfg
@@ -198,10 +205,25 @@ efibootmgr -c -d "$DISK" -p 1 \
   -L "Arch Linux" \
   -l '\\EFI\\GRUB\\grubx64.efi'
 
+echo "Chroot setup complete"
 EOF
 
+chmod +x /mnt/root/chroot-setup.sh
+
 ########################################
-# Done
+# Chroot execution
 ########################################
-info "Installation finished. Rebooting..."
+info "Entering chroot"
+arch-chroot /mnt /root/chroot-setup.sh
+
+########################################
+# Cleanup
+########################################
+rm /mnt/root/chroot-setup.sh
+
+########################################
+# Finish
+########################################
+info "Installation complete!"
+info "Rebooting..."
 reboot
