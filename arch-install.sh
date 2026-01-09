@@ -16,7 +16,7 @@ if [[ "${1:-}" == "--dry-run" ]]; then
 fi
 
 ########################################
-# Logging (console + file)
+# Logging
 ########################################
 mkdir -p /var/log
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -24,13 +24,8 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 ########################################
 # Helpers
 ########################################
-info() {
-  echo -e "\e[32m==>\e[0m $1"
-}
-
-warn() {
-  echo -e "\e[33mWARNING:\e[0m $1"
-}
+info() { echo -e "\e[32m==>\e[0m $1"; }
+warn() { echo -e "\e[33mWARNING:\e[0m $1"; }
 
 error() {
   echo -e "\e[31mERROR:\e[0m $1"
@@ -41,7 +36,7 @@ error() {
 
 confirm() {
   read -rp "$1 [y/N]: " ans
-  [[ "$ans" == "y" || "$ans" == "Y" ]]
+  [[ "$ans" =~ ^[Yy]$ ]]
 }
 
 run() {
@@ -53,13 +48,12 @@ run() {
 }
 
 ########################################
-# Auto-cleanup on unexpected exit
+# Auto-cleanup on failure
 ########################################
 trap 'warn "Unexpected error, cleaning up..."; umount -R /mnt || true; cryptsetup close cryptlvm || true' ERR
 
-
 ########################################
-# Internet check
+# Internet
 ########################################
 info "Checking internet connection"
 ping -c 1 archlinux.org &>/dev/null || error "No internet connection"
@@ -73,27 +67,50 @@ run "timedatectl set-ntp true"
 # Disk selection
 ########################################
 lsblk
-read -rp "Enter disk (e.g. /dev/sda): " DISK
+read -rp "Enter disk (default /dev/sda): " DISK
+DISK=${DISK:-/dev/sda}
 [[ -b "$DISK" ]] || error "Invalid disk: $DISK"
 
-EFI_SIZE="2G"
-ROOT_SIZE="200G"
+DISK_SIZE_BYTES=$(blockdev --getsize64 "$DISK")
+DISK_SIZE_HUMAN=$(lsblk -dn -o SIZE "$DISK")
 
+########################################
+# Size prompts
+########################################
+echo
+info "Selected disk: $DISK ($DISK_SIZE_HUMAN)"
+
+read -rp "EFI size (default 2G): " EFI_SIZE
+EFI_SIZE=${EFI_SIZE:-2G}
+
+read -rp "Root size (e.g. 200G or fixed size, default 200G): " ROOT_SIZE
+ROOT_SIZE=${ROOT_SIZE:-200G}
+
+read -rp "Home size (e.g. 100%FREE or fixed size, default 100%FREE): " HOME_SIZE
+HOME_SIZE=${HOME_SIZE:-100%FREE}
+
+if [[ "$ROOT_SIZE" == "100%FREE" && "$HOME_SIZE" == "100%FREE" ]]; then
+  error "Root and Home cannot both use 100%FREE"
+fi
+
+########################################
+# Partitions
+########################################
 EFI_PART="${DISK}1"
 LUKS_PART="${DISK}2"
 
 ########################################
-# Preflight summary
+# Preflight
 ########################################
 clear
 echo "========================================="
 echo " ARCH LINUX INSTALLATION PREFLIGHT"
 echo "========================================="
 echo
-echo " Disk            : $DISK"
-echo " EFI partition   : $EFI_SIZE  (FAT32)"
+echo " Disk            : $DISK ($DISK_SIZE_HUMAN)"
+echo " EFI partition   : $EFI_SIZE (FAT32)"
 echo " Root LV         : $ROOT_SIZE (ext4)"
-echo " Home LV         : Remaining (~$(blockdev --getsize64 "$DISK") bytes - 200G - 2G) (ext4)"
+echo " Home LV         : $HOME_SIZE (ext4)"
 echo " Encryption      : LUKS + LVM"
 echo " Boot mode       : UEFI"
 echo " Dry-run         : $DRY_RUN"
@@ -103,9 +120,9 @@ echo
 confirm "Proceed with installation?" || exit 0
 
 ########################################
-# Disk wipe (signatures only)
+# Disk wipe
 ########################################
-info "Wiping old disk signatures"
+info "Wiping disk signatures"
 run "wipefs -a $DISK"
 
 ########################################
@@ -113,20 +130,19 @@ run "wipefs -a $DISK"
 ########################################
 info "Partitioning disk"
 run "parted -s $DISK mklabel gpt"
-run "parted -s $DISK mkpart ESP fat32 1MiB 2049MiB"
+run "parted -s $DISK mkpart ESP fat32 1MiB $EFI_SIZE"
 run "parted -s $DISK set 1 esp on"
-run "parted -s $DISK mkpart primary 2049MiB 100%"
+run "parted -s $DISK mkpart primary $EFI_SIZE 100%"
 
 ########################################
 # Filesystems
 ########################################
-info "Formatting EFI partition"
 run "mkfs.fat -F32 $EFI_PART"
 
 ########################################
 # LUKS
 ########################################
-info "Setting up LUKS encryption"
+info "Setting up LUKS"
 run "cryptsetup luksFormat $LUKS_PART"
 run "cryptsetup open $LUKS_PART cryptlvm"
 
@@ -136,11 +152,17 @@ run "cryptsetup open $LUKS_PART cryptlvm"
 info "Creating LVM layout"
 run "pvcreate /dev/mapper/cryptlvm"
 run "vgcreate vg0 /dev/mapper/cryptlvm"
+
 run "lvcreate -L $ROOT_SIZE vg0 -n root"
-run "lvcreate -l 100%FREE vg0 -n home"
+
+if [[ "$HOME_SIZE" == "100%FREE" ]]; then
+  run "lvcreate -l 100%FREE vg0 -n home"
+else
+  run "lvcreate -L $HOME_SIZE vg0 -n home"
+fi
 
 ########################################
-# Filesystems on LVM
+# Filesystems
 ########################################
 run "mkfs.ext4 /dev/vg0/root"
 run "mkfs.ext4 /dev/vg0/home"
@@ -149,24 +171,31 @@ run "mkfs.ext4 /dev/vg0/home"
 # Mounting
 ########################################
 run "mount /dev/vg0/root /mnt"
-run "mkdir -p /mnt/home"
+run "mkdir -p /mnt/home /mnt/boot"
 run "mount /dev/vg0/home /mnt/home"
-run "mkdir -p /mnt/boot"
 run "mount $EFI_PART /mnt/boot"
 
 ########################################
-# Mirrors
+# Mirrors (fast + global)
 ########################################
 info "Configuring mirrors"
+
 run "pacman -Sy --noconfirm reflector"
 run "cp /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist.backup"
 
+COUNTRY=$(curl -s https://ipinfo.io/country || echo "*")
+
 run "reflector \
-  --country Bangladesh,India,Singapore \
-  --latest 10 \
   --protocol https \
-  --sort rate --fastest 5 \
+  --completion-percent 100 \
+  --country \"$COUNTRY,*\" \
+  --sort country \
+  --sort score \
+  --connection-timeout 15 \
+  --download-timeout 15 \
   --save /etc/pacman.d/mirrorlist"
+
+head -n 15 /etc/pacman.d/mirrorlist
 
 ########################################
 # Base install
@@ -180,11 +209,10 @@ run "pacstrap -K /mnt \
 ########################################
 # fstab
 ########################################
-info "Generating fstab"
 run "genfstab -U /mnt > /mnt/etc/fstab"
 
 ########################################
-# Chroot script
+# Chroot setup
 ########################################
 UUID=$(blkid -s UUID -o value "$LUKS_PART")
 
@@ -192,7 +220,6 @@ cat <<EOF > /mnt/chroot-setup.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "Logging to /var/log/arch-install.log" >> /var/log/arch-install.log
 exec >> /var/log/arch-install.log 2>&1
 
 read -rp "Timezone (default Asia/Dhaka): " TZ
@@ -229,20 +256,21 @@ grub-mkconfig -o /boot/grub/grub.cfg
 mkdir -p /boot/EFI/BOOT
 cp /boot/EFI/GRUB/grubx64.efi /boot/EFI/BOOT/BOOTX64.EFI
 
-efibootmgr -c -d "$DISK" -p 1 \
-  -L "Arch Linux" \
-  -l '\\EFI\\GRUB\\grubx64.efi'
+efibootmgr -c -d "$DISK" -p 1 -L "Arch Linux" -l '\\EFI\\GRUB\\grubx64.efi'
 EOF
 
 run "chmod +x /mnt/chroot-setup.sh"
 
 ########################################
-# Chroot execution
+# Chroot
 ########################################
 if ! $DRY_RUN; then
   arch-chroot /mnt /chroot-setup.sh
 fi
 
+########################################
+# Cleanup
+########################################
 run "umount -R /mnt || true"
 run "cryptsetup close cryptlvm || true"
 
@@ -250,6 +278,5 @@ run "cryptsetup close cryptlvm || true"
 # Finish
 ########################################
 info "Installation completed successfully"
-warn "Log file saved at $LOG_FILE"
-warn "You may now reboot"
+warn "Log saved at $LOG_FILE"
 confirm "Reboot now?" && run "reboot"
