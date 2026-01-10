@@ -1,56 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-########################################
-# Globals
-########################################
-LOG_FILE="/var/log/arch-install.log"
-DRY_RUN=false
-
-########################################
-# Argument parsing
-########################################
-if [[ "${1:-}" == "--dry-run" ]]; then
-  DRY_RUN=true
-  echo "⚠️  DRY-RUN MODE ENABLED — no changes will be made"
-fi
-
-########################################
-# Logging
-########################################
-mkdir -p /var/log
-exec > >(tee -a "$LOG_FILE") 2>&1
+source ./utils.sh
 
 ########################################
 # Helpers
 ########################################
-info() { echo -e "\e[32m==>\e[0m $1"; }
-warn() { echo -e "\e[33mWARNING:\e[0m $1"; }
 
-error() {
-  echo -e "\e[31mERROR:\e[0m $1"
-  umount -R /mnt || true
-  cryptsetup close cryptlvm || true
-  exit 1
-}
+cleanup() {
+  warn "Cleaning up mounted filesystems and crypto devices..."
 
-confirm() {
-  read -rp "$1 [y/N]: " ans
-  [[ "$ans" =~ ^[Yy]$ ]]
-}
+  run "umount -R /mnt 2>/dev/null || true"
 
-run() {
-  if $DRY_RUN; then
-    echo "[DRY-RUN] $*"
-  else
-    eval "$@"
+  if vgdisplay vg0 &>/dev/null; then
+    run "lvchange -an vg0 2>/dev/null || true"
+    run "vgchange -an vg0 2>/dev/null || true"
+  fi
+
+  if cryptsetup status cryptlvm &>/dev/null; then
+    run "cryptsetup close cryptlvm || true"
   fi
 }
 
 ########################################
 # Auto-cleanup on failure
 ########################################
-trap 'warn "Unexpected error, cleaning up..."; umount -R /mnt || true; cryptsetup close cryptlvm || true' ERR
+trap 'warn "Unexpected error, cleaning up..."; cleanup' ERR
 
 ########################################
 # Internet
@@ -68,17 +43,17 @@ run "timedatectl set-ntp true"
 ########################################
 lsblk
 read -rp "Enter disk (default /dev/sda): " DISK
-DISK=${DISK:-/dev/sda}
-[[ -b "$DISK" ]] || error "Invalid disk: $DISK"
+DISK_NAME=${DISK_NAME:-/dev/sda}
+[[ -b "$DISK_NAME" ]] || error "Invalid disk: $DISK_NAME"
 
-DISK_SIZE_BYTES=$(blockdev --getsize64 "$DISK")
-DISK_SIZE_HUMAN=$(lsblk -dn -o SIZE "$DISK")
+DISK_SIZE_BYTES=$(blockdev --getsize64 "$DISK_NAME")
+DISK_SIZE_HUMAN=$(lsblk -dn -o SIZE "$DISK_NAME")
 
 ########################################
 # Size prompts
 ########################################
 echo
-info "Selected disk: $DISK ($DISK_SIZE_HUMAN)"
+info "Selected disk: $DISK_NAME ($DISK_SIZE_HUMAN)"
 
 read -rp "EFI size (default 2G): " EFI_SIZE
 EFI_SIZE=${EFI_SIZE:-2G}
@@ -96,8 +71,8 @@ fi
 ########################################
 # Partitions
 ########################################
-EFI_PART="${DISK}1"
-LUKS_PART="${DISK}2"
+EFI_PART="${DISK_NAME}1"
+LUKS_PART="${DISK_NAME}2"
 
 ########################################
 # Preflight
@@ -107,7 +82,7 @@ echo "========================================="
 echo " ARCH LINUX INSTALLATION PREFLIGHT"
 echo "========================================="
 echo
-echo " Disk            : $DISK ($DISK_SIZE_HUMAN)"
+echo " Disk            : $DISK_NAME ($DISK_SIZE_HUMAN)"
 echo " EFI partition   : $EFI_SIZE (FAT32)"
 echo " Root LV         : $ROOT_SIZE (ext4)"
 echo " Home LV         : $HOME_SIZE (ext4)"
@@ -122,17 +97,20 @@ confirm "Proceed with installation?" || exit 0
 ########################################
 # Disk wipe
 ########################################
+info "Clearing existing mounts and crypto devices"
+cleanup
+
 info "Wiping disk signatures"
-run "wipefs -a $DISK"
+run "wipefs -a $DISK_NAME"
 
 ########################################
 # Partitioning
 ########################################
 info "Partitioning disk"
-run "parted -s $DISK mklabel gpt"
-run "parted -s $DISK mkpart ESP fat32 1MiB $EFI_SIZE"
-run "parted -s $DISK set 1 esp on"
-run "parted -s $DISK mkpart primary $EFI_SIZE 100%"
+run "parted -s $DISK_NAME mklabel gpt"
+run "parted -s $DISK_NAME mkpart ESP fat32 1MiB $EFI_SIZE"
+run "parted -s $DISK_NAME set 1 esp on"
+run "parted -s $DISK_NAME mkpart primary $EFI_SIZE 100%"
 
 ########################################
 # Filesystems
@@ -175,36 +153,17 @@ run "mkdir -p /mnt/home /mnt/boot"
 run "mount /dev/vg0/home /mnt/home"
 run "mount $EFI_PART /mnt/boot"
 
-########################################
-# Mirrors (fast + global)
-########################################
-info "Configuring mirrors"
 
-run "pacman -Sy --noconfirm reflector"
-run "cp /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist.backup"
+# Modify pacman config
 
-COUNTRY=$(curl -s https://ipinfo.io/country || echo "*")
-
-run "reflector \
-  --protocol https \
-  --completion-percent 100 \
-  --country \"$COUNTRY,*\" \
-  --sort country \
-  --sort score \
-  --connection-timeout 15 \
-  --download-timeout 15 \
-  --save /etc/pacman.d/mirrorlist"
-
-head -n 15 /etc/pacman.d/mirrorlist
+sed -i 's/^#Color/Color/' /etc/pacman.conf
 
 ########################################
 # Base install
 ########################################
-info "Installing base system"
-run "pacstrap -K /mnt \
-  base linux linux-firmware sof-firmware intel-ucode base-devel \
-  grub efibootmgr networkmanager vim \
-  lvm2 cryptsetup"
+info "Installing base system with pacstrap"
+run "script -q -c "pacstrap -K /mnt base linux linux-firmware sof-firmware intel-ucode base-devel grub efibootmgr networkmanager cryptsetup lvm2 vim zsh" /dev/null"
+info "Base system installed with pacstrap"
 
 ########################################
 # fstab
@@ -214,65 +173,22 @@ run "genfstab -U /mnt > /mnt/etc/fstab"
 ########################################
 # Chroot setup
 ########################################
-UUID=$(blkid -s UUID -o value "$LUKS_PART")
-
-cat <<EOF > /mnt/chroot-setup.sh
-#!/usr/bin/env bash
-set -euo pipefail
-
-exec >> /var/log/arch-install.log 2>&1
-
-read -rp "Timezone (default Asia/Dhaka): " TZ
-TZ=\${TZ:-Asia/Dhaka}
-ln -sf /usr/share/zoneinfo/\$TZ /etc/localtime
-hwclock --systohc
-
-sed -i 's/^#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
-locale-gen
-echo "LANG=en_US.UTF-8" > /etc/locale.conf
-
-read -rp "Hostname: " HOSTNAME
-echo "\$HOSTNAME" > /etc/hostname
-
-sed -i 's/^HOOKS=.*/HOOKS=(base udev autodetect keyboard keymap consolefont modconf block encrypt lvm2 filesystems fsck)/' /etc/mkinitcpio.conf
-mkinitcpio -P
-
-echo "Set root password"
-passwd
-
-read -rp "New username: " USERNAME
-useradd -m -G wheel -s /bin/bash "\$USERNAME"
-passwd "\$USERNAME"
-
-sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
-
-systemctl enable NetworkManager
-
-sed -i 's|^GRUB_CMDLINE_LINUX=.*|GRUB_CMDLINE_LINUX="cryptdevice=UUID=$UUID:cryptlvm root=/dev/vg0/root"|' /etc/default/grub
-
-grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
-grub-mkconfig -o /boot/grub/grub.cfg
-
-mkdir -p /boot/EFI/BOOT
-cp /boot/EFI/GRUB/grubx64.efi /boot/EFI/BOOT/BOOTX64.EFI
-
-efibootmgr -c -d "$DISK" -p 1 -L "Arch Linux" -l '\\EFI\\GRUB\\grubx64.efi'
-EOF
-
-run "chmod +x /mnt/chroot-setup.sh"
+LUKS_PART_UUID=$(blkid -s UUID -o value "$LUKS_PART")
 
 ########################################
 # Chroot
 ########################################
 if ! $DRY_RUN; then
-  arch-chroot /mnt /chroot-setup.sh
+  rm -rf /mnt/chroot-setup.sh
+  wget https://raw.githubusercontent.com/sayyedulawwab/linux-scripts/main/chroot-setup.sh -O /mnt/chroot-setup.sh
+  run "chmod +x /mnt/chroot-setup.sh"
+  arch-chroot /mnt /chroot-setup.sh $LUKS_PART_UUID $DISK_NAME
 fi
 
 ########################################
 # Cleanup
 ########################################
-run "umount -R /mnt || true"
-run "cryptsetup close cryptlvm || true"
+cleanup
 
 ########################################
 # Finish
