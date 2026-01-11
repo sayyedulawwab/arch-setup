@@ -1,0 +1,10 @@
+
+
+Host aur.archlinux.org
+  User aur
+  Hostname aur.archlinux.org
+  IdentityFile ~/.ssh/id_ed25519
+  # Optional: Use this if you want to avoid a "Host key verification failed" prompt the first time
+  StrictHostKeyChecking no 
+  # Optional: Use this if you use an ssh-agent and want to use it
+  ForwardAgent yes
