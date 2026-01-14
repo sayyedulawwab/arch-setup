@@ -9,40 +9,73 @@ CONFIG_DIR="${REPO_DIR}/config"
 HOME_DIR="${REPO_DIR}/home"
 
 ########################################
-# Functions
+# Colors & logging
 ########################################
+GREEN="\e[32m"
+YELLOW="\e[33m"
+RESET="\e[0m"
+
 info() {
-    echo -e "\e[32m==>\e[0m $1"
+    echo -e "${GREEN}==>${RESET} $1"
 }
 
-link_file() {
+warn() {
+    echo -e "${YELLOW}WARNING:${RESET} $1"
+}
+
+########################################
+# Safe symlink function
+########################################
+link() {
     local src="$1"
     local dest="$2"
-    mkdir -p "$(dirname "$dest")"
-    ln -sf "$src" "$dest"
+
+    # If destination exists and is not a symlink, back it up
+    if [ -e "$dest" ] && [ ! -L "$dest" ]; then
+        warn "Backing up existing $dest → $dest.bak"
+        mv "$dest" "$dest.bak"
+    fi
+
+    ln -sfnT "$src" "$dest"
     echo "Linked $dest → $src"
 }
 
 ########################################
-# Symlink home dotfiles
+# Sanity checks
+########################################
+info "Checking repository structure..."
+
+[ -d "$CONFIG_DIR" ] || { echo "Missing config directory"; exit 1; }
+[ -d "$HOME_DIR" ]   || { echo "Missing home directory"; exit 1; }
+
+########################################
+# Link home dotfiles
 ########################################
 info "Linking home dotfiles..."
+
 for file in "$HOME_DIR"/.*; do
-    filename="$(basename "$file")"
-    # skip . and ..
-    [[ "$filename" == "." || "$filename" == ".." ]] && continue
-    # skip .git if present
-    [[ "$filename" == ".git" ]] && continue
-    link_file "$file" "$HOME/$filename"
+    name="$(basename "$file")"
+
+    # Skip special entries
+    [[ "$name" == "." || "$name" == ".." || "$name" == ".git" ]] && continue
+
+    link "$file" "$HOME/$name"
 done
 
 ########################################
-# Symlink .config folders
+# Link .config directories
 ########################################
-info "Linking .config folders..."
-for folder in "$CONFIG_DIR"/*; do
-    foldername="$(basename "$folder")"
-    link_file "$folder" "$HOME/.config/$foldername"
+info "Linking ~/.config directories..."
+
+mkdir -p "$HOME/.config"
+
+for dir in "$CONFIG_DIR"/*; do
+    name="$(basename "$dir")"
+    link "$dir" "$HOME/.config/$name"
 done
 
-info "All symlinks created successfully!"
+########################################
+# Done
+########################################
+info "All dotfiles successfully linked!"
+
